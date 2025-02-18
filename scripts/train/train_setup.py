@@ -1,13 +1,13 @@
 """
-增强版训练配置，主要改进：
-1. 分布式梯度裁剪
-2. 学习率预热机制
-3. 梯度监控系统
+Logic for model creation, training launching and actions needed to be
+accomplished during training (metrics monitor, model saving etc.)
 """
+
 import sys
 import os
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 sys.path.append(project_root)
+
 import time
 import json
 import numpy as np
@@ -17,186 +17,190 @@ from protonet_tf2.protonet import TrainEngine
 from protonet_tf2.protonet.models import Prototypical
 from protonet_tf2.protonet.datasets import load
 
-"""
-修复学习率调度器访问问题的完整代码
-"""
 
-import sys
-import os
-import time
-import json
-import numpy as np
-import tensorflow as tf
-from datetime import datetime
-from protonet_tf2.protonet import TrainEngine
-from protonet_tf2.protonet.models import Prototypical
-from protonet_tf2.protonet.datasets import load
+def _create_distributed_dataset(strategy, data_loader, config):
+    """Create distributed dataset pipeline"""
+    n_way = data_loader.n_way
+    n_support = data_loader.n_support
+    n_query = data_loader.n_query
 
+    def _episode_generator():
+        while True:
+            support, query = data_loader.get_next_episode()
+            # 确保形状符合预期
+            support = np.reshape(support, (n_way, n_support, 84, 84, 3))
+            query = np.reshape(query, (n_way, n_query, 84, 84, 3))
+            yield (support.astype(np.float32), query.astype(np.float32))
+
+    dataset = tf.data.Dataset.from_generator(
+        _episode_generator,
+        output_types=(tf.float32, tf.float32),
+        output_shapes=(
+            tf.TensorShape([n_way, n_support, 84, 84, 3]),  # 明确指定形状
+            tf.TensorShape([n_way, n_query, 84, 84, 3])
+        )
+    )
+
+    options = tf.data.Options()
+    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+    dataset = dataset.with_options(options)
+
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+    return strategy.experimental_distribute_dataset(dataset)
 
 def train(config):
-    # 分布式策略初始化
-    strategy = tf.distribute.MirroredStrategy()
-    print(f'可用设备数: {strategy.num_replicas_in_sync}')
+    # 初始化多GPU策略
+    strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.NcclAllReduce())
+    print(f'Number of devices: {strategy.num_replicas_in_sync}')
 
+    np.random.seed(2019)
+    tf.random.set_seed(2019)
+
+    # 创建模型和优化器在策略范围内
     with strategy.scope():
-        # 动态调整批量大小
-        config['data.batch_size'] *= strategy.num_replicas_in_sync
+        # 模型定义
+        n_support = config['data.train_support']
+        n_query = config['data.train_query']
+        w, h, c = list(map(int, config['model.x_dim'].split(',')))
+        model = Prototypical(n_support, n_query, w, h, c,
+                           nb_layers=config['model.nb_layers'],
+                           nb_filters=config['model.nb_filters'])
 
-        # 模型初始化
-        w, h, c = map(int, config['model.x_dim'].split(','))
-        model = Prototypical(
-            n_support=config['data.train_support'],
-            n_query=config['data.train_query'],
-            w=w, h=h, c=c,
-            nb_layers=config['model.nb_layers'],
-            nb_filters=config['model.nb_filters']
-        )
+        # 优化器
+        optimizer = tf.keras.optimizers.Adam(config['train.lr'])
 
-        # 学习率管理（核心修复）
-        base_lr = tf.Variable(config['train.lr'], dtype=tf.float32, name='base_learning_rate')
-        global_step = tf.Variable(0, trainable=False, dtype=tf.int64)
-
-        lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-            initial_learning_rate=base_lr,
-            decay_steps=config.get('train.decay_steps', 1000),
-            decay_rate=0.95,
-            staircase=True
-        )
-
-        # 优化器配置
-        optimizer = tf.keras.optimizers.Adam(
-            learning_rate=lr_schedule(global_step),  # 直接使用调度函数
-            beta_1=0.9,
-            beta_2=0.999,
-            epsilon=1e-07
-        )
-
-    # 监控指标
-    train_loss = tf.keras.metrics.Mean(name='train_loss')
-    train_acc = tf.keras.metrics.Mean(name='train_acc')
-    val_loss = tf.keras.metrics.Mean(name='val_loss')
-    val_acc = tf.keras.metrics.Mean(name='val_acc')
+        # 分布式指标
+        train_loss = tf.keras.metrics.Mean(name='train_loss')
+        train_acc = tf.keras.metrics.Mean(name='train_accuracy')
+        val_loss = tf.keras.metrics.Mean(name='val_loss')
+        val_acc = tf.keras.metrics.Mean(name='val_accuracy')
 
     # 文件路径配置
-    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-    model_dir = f"results/{config['data.dataset']}/protonet"
-    os.makedirs(f"{model_dir}/checkpoints", exist_ok=True)
-    model_path = f"{model_dir}/checkpoints/model_{timestamp}.h5"
+    now_as_str = datetime.now().strftime('%Y_%m_%d-%H:%M:%S')
+    model_file = config['model.save_path'].format(config['model.type'], now_as_str)
+    config_file = config['output.config_path'].format(config['model.type'], now_as_str)
+    csv_output_file = config['output.train_path'].format(config['model.type'], now_as_str)
 
+    # 创建目录
+    os.makedirs(os.path.dirname(model_file), exist_ok=True)
+    os.makedirs(os.path.dirname(config_file), exist_ok=True)
+    os.makedirs(os.path.dirname(csv_output_file), exist_ok=True)
+
+    # 加载数据集
+    data_dir = f"../datasets/{config['data.dataset']}"
+    ret = load(data_dir, config, ['train', 'val'])
+    train_loader = ret['train']
+    val_loader = ret['val']
+
+    # 创建分布式数据集
+    train_dist_dataset = _create_distributed_dataset(strategy, train_loader, config)
+    val_dist_dataset = _create_distributed_dataset(strategy, val_loader, config)
+
+    # 定义训练步骤
     @tf.function
-    def distributed_train_step(support, query):
+    def train_step(iterator):
         def step_fn(inputs):
-            s, q = inputs
+            support, query = inputs
             with tf.GradientTape() as tape:
-                loss, acc = model(s, q)
-                loss = tf.debugging.check_numerics(loss, "损失值异常")
+                loss, acc = model(support, query)
 
             gradients = tape.gradient(loss, model.trainable_variables)
-            gradients = [tf.clip_by_norm(g, 5.0) for g in gradients]
             optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-            return loss, acc
-
-        per_replica_loss, per_replica_acc = strategy.run(step_fn, args=((support, query),))
-        return (
-            strategy.reduce(tf.distribute.ReduceOp.MEAN, per_replica_loss, axis=None),
-            strategy.reduce(tf.distribute.ReduceOp.MEAN, per_replica_acc, axis=None)
-        )
-
-    # 训练引擎配置
-    engine = TrainEngine()
-
-    def on_start_batch(state):
-        try:
-            # 更新全局步数
-            tf.compat.v1.assign_add(global_step, 1)
-
-            support, query = state['batch']
-            support = tf.clip_by_value(support, 0.0, 1.0)
-            query = tf.clip_by_value(query, 0.0, 1.0)
-
-            loss, acc = distributed_train_step(support, query)
-
-            # 获取当前实际学习率
-            current_lr = optimizer.learning_rate.numpy()
-
             train_loss.update_state(loss)
             train_acc.update_state(acc)
+            return loss
 
-            if state['total_batch'] % 10 == 0:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Batch {state['total_batch']} - "
-                      f"Loss: {loss:.4f} Acc: {acc * 100:.2f}% LR: {current_lr:.2e}")
+        for _ in tf.range(tf.convert_to_tensor(config['data.batch_size'])):
+            strategy.run(step_fn, args=(next(iterator),))
 
-        except tf.errors.InvalidArgumentError as e:
-            print(f"\n数值异常: {str(e)}")
-            # 直接修改基础学习率变量
-            new_lr = base_lr.assign(base_lr * 0.5)
-            print(f"降低学习率至: {new_lr.numpy():.2e}")
-            state['total_batch'] -= 1
+    # 定义验证步骤
+    @tf.function
+    def test_step(iterator):
+        def step_fn(inputs):
+            support, query = inputs
+            loss, acc = model(support, query)
+            val_loss.update_state(loss)
+            val_acc.update_state(acc)
+            return loss
+
+        for _ in tf.range(tf.convert_to_tensor(config['data.batch_size'])):
+            strategy.run(step_fn, args=(next(iterator),))
+
+    # 创建训练引擎
+    train_engine = TrainEngine()
+
+    # 训练过程钩子函数
+    def on_start_epoch(state):
+        print(f"Epoch {state['epoch']} started.")
+        train_loss.reset_states()
+        train_acc.reset_states()
 
     def on_end_epoch(state):
-        try:
-            val_results = []
-            for _ in range(config['data.val_batches']):
-                s, q = state['val_loader'].get_batch()
-                loss, acc = distributed_val_step(s, q)
-                val_loss.update_state(loss)
-                val_acc.update_state(acc)
-                val_results.append((loss.numpy(), acc.numpy()))
+        # 验证阶段
+        val_iterator = iter(val_dist_dataset)
+        for _ in range(config['data.episodes'] // config['data.batch_size']):
+            test_step(val_iterator)
 
-            avg_val_loss = np.nanmean([x[0] for x in val_results])
-            avg_val_acc = np.nanmean([x[1] for x in val_results])
+        # 打印指标
+        template = 'Epoch {}, Loss: {:.4f}, Accuracy: {:.2f}%, Val Loss: {:.4f}, Val Accuracy: {:.2f}%'
+        print(template.format(
+            state['epoch'],
+            train_loss.result(),
+            train_acc.result() * 100,
+            val_loss.result(),
+            val_acc.result() * 100
+        ))
 
-            print(f"\nEpoch {state['epoch']} 结果:")
-            print(f"训练损失: {train_loss.result():.4f} 准确率: {train_acc.result() * 100:.2f}%")
-            print(f"验证损失: {avg_val_loss:.4f} 准确率: {avg_val_acc * 100:.2f}%")
+        # 记录到CSV
+        with open(csv_output_file, 'a') as f:
+            f.write(f"{state['epoch']}, {train_loss.result():.4f}, {train_acc.result() * 100:.2f}, "
+                    f"{val_loss.result():.4f}, {val_acc.result() * 100:.2f}\n")
 
-            if avg_val_loss < state['best_val_loss']:
-                state['best_val_loss'] = avg_val_loss
-                state['best_epoch'] = state['epoch']
-                model.save_weights(model_path)
-                print(f"保存最佳模型至 {model_path}")
+        # 保存最佳模型
+        current_val_loss = val_loss.result().numpy()
+        if current_val_loss < state['best_val_loss']:
+            state['best_val_loss'] = current_val_loss
+            model.save(model_file)
 
-            train_loss.reset_states()
-            train_acc.reset_states()
-            val_loss.reset_states()
-            val_acc.reset_states()
-
-        except Exception as e:
-            print(f"验证异常: {str(e)}")
+        # 早停机制
+        state['val_losses'].append(current_val_loss)
+        if len(state['val_losses']) > config['train.patience'] and \
+                all(v >= state['val_losses'][-config['train.patience']]
+                    for v in state['val_losses'][-config['train.patience']:]):
             state['early_stopping_triggered'] = True
 
-    engine.hooks.update({
-        'on_start_batch': on_start_batch,
+        val_loss.reset_states()
+        val_acc.reset_states()
+
+    # 注册钩子
+    train_engine.hooks.update({
+        'on_start_epoch': on_start_epoch,
         'on_end_epoch': on_end_epoch
     })
 
     # 初始化训练状态
-    data_dir = f"datasets/{config['data.dataset']}"
     state = {
-        'train_loader': load(data_dir, config, ['train']).get('train'),
-        'val_loader': load(data_dir, config, ['val']).get('val'),
         'epoch': 1,
-        'total_batch': 1,
-        'epochs': config['train.epochs'],
-        'batches_per_epoch': config['data.batches_per_epoch'],
-        'best_val_loss': float('inf'),
-        'early_stopping_triggered': False
+        'best_val_loss': np.inf,
+        'val_losses': [],
+        'early_stopping_triggered': False,
+        'epochs': config['train.epochs']
     }
 
-    print("\n训练启动...")
-    print(f"初始基础学习率: {base_lr.numpy():.2e}")
-    start_time = time.time()
-    try:
-        engine.train(
-            train_loader=state['train_loader'],
-            val_loader=state['val_loader'],
-            epochs=config['train.epochs'],
-            batches_per_epoch=config['data.batches_per_epoch'],
-            state=state
-        )
-    finally:
-        final_model_path = f"{model_dir}/checkpoints/final_{timestamp}.h5"
-        model.save_weights(final_model_path)
-        print(f"训练完成，最终模型保存至: {final_model_path}")
+    # 启动训练循环
+    train_iterator = iter(train_dist_dataset)
+    for epoch in range(config['train.epochs']):
+        train_engine.hooks['on_start_epoch'](state)
 
-    return state
+        # 训练阶段
+        for _ in range(config['data.episodes'] // config['data.batch_size']):
+            train_step(train_iterator)
+
+        train_engine.hooks['on_end_epoch'](state)
+        state['epoch'] += 1
+
+        if state['early_stopping_triggered']:
+            print("Early stopping triggered!")
+            break
+
+    print(f"Training completed. Best validation loss: {state['best_val_loss']:.4f}")

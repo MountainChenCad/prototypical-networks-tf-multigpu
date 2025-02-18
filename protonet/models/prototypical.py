@@ -1,189 +1,187 @@
+import numpy as np
 import tensorflow as tf
-from tensorflow.keras.layers import Dense, Flatten, Conv2D, BatchNormalization, ReLU, MaxPool2D, Add, \
-    GlobalAveragePooling2D, LeakyReLU, Layer
+from tensorflow.keras.layers import Dense, Flatten, Conv2D, BatchNormalization, ReLU, MaxPool2D, Add, GlobalAveragePooling2D, LeakyReLU, Layer
 from tensorflow.keras import Model
 
-
 def calc_euclidian_dists(x, y):
-    """数值稳定的距离计算"""
-    # 输入x和y已经是L2归一化的
-    # x形状: [batch, n_query, 1, z_dim]
-    # y形状: [batch, 1, n_way, z_dim]
-    cosine_similarity = tf.reduce_sum(x * y, axis=-1)  # [batch, n_query, n_way]
-    return 2 - 2 * cosine_similarity  # 转换为欧氏距离平方
-
+    n = x.shape[0]
+    m = y.shape[0]
+    x = tf.tile(tf.expand_dims(x, 1), [1, m, 1])
+    y = tf.tile(tf.expand_dims(y, 0), [n, 1, 1])
+    return tf.reduce_mean(tf.math.pow(x - y, 2), 2)
 
 class DropBlock2D(Layer):
-    def __init__(self, keep_prob, block_size, **kwargs):
-        super(DropBlock2D, self).__init__(**kwargs)
+    def __init__(self, keep_prob, block_size):
+        super(DropBlock2D, self).__init__()
         self.keep_prob = keep_prob
         self.block_size = block_size
 
     def call(self, inputs, training=False):
         if not training:
             return inputs
-        gamma = (1. - self.keep_prob) * tf.math.reduce_prod(tf.cast(inputs.shape[1:3], tf.float32)) / (
-                    self.block_size ** 2)
+        # Compute the mask
+        gamma = (1. - self.keep_prob) * tf.math.reduce_prod(tf.cast(inputs.shape[1:3], tf.float32)) / (self.block_size ** 2)
         mask = tf.cast(tf.random.uniform(tf.shape(inputs)) < gamma, tf.float32)
         mask = tf.nn.max_pool2d(mask, ksize=self.block_size, strides=1, padding='SAME')
-        return inputs * (1 - mask)
+        mask = 1 - mask
+        return inputs * mask
 
     def get_config(self):
-        config = super().get_config()
+        config = super(DropBlock2D, self).get_config()
         config.update({
             'keep_prob': self.keep_prob,
-            'block_size': self.block_size
+            'block_size': self.block_size,
         })
         return config
 
+    def compute_output_shape(self, input_shape):
+        # 输出形状与输入形状相同
+        return input_shape
 
 class ResidualBlock(Layer):
-    def __init__(self, filters, downsample=False, kernel_initializer='he_normal', use_bias=False, **kwargs):
-        super(ResidualBlock, self).__init__(**kwargs)
-        self.filters = filters
+    def __init__(self, filters, downsample=False):
+        super(ResidualBlock, self).__init__()
+        self.filters = filters  # 保存 filters 参数
         self.downsample = downsample
-        self.kernel_initializer = kernel_initializer
-        self.use_bias = use_bias
-
-        # 主路径
-        self.conv1 = Conv2D(filters, 3, padding='same', strides=2 if downsample else 1,
-                            kernel_initializer=kernel_initializer, use_bias=use_bias)
+        self.conv1 = Conv2D(filters, kernel_size=3, padding='same')
         self.bn1 = BatchNormalization()
-
-        self.conv2 = Conv2D(filters, 3, padding='same',
-                            kernel_initializer=kernel_initializer, use_bias=use_bias)
+        self.relu1 = LeakyReLU()
+        self.conv2 = Conv2D(filters, kernel_size=3, padding='same')
         self.bn2 = BatchNormalization()
-
-        # 跳跃连接
-        self.shortcut = tf.keras.Sequential()
-        if downsample:
-            self.shortcut.add(Conv2D(filters, 1, strides=2,
-                                     kernel_initializer=kernel_initializer, use_bias=use_bias))
-            self.shortcut.add(BatchNormalization())
-
-        # 正则化
+        self.relu2 = LeakyReLU()
+        self.conv3 = Conv2D(filters, kernel_size=3, padding='same')
+        self.bn3 = BatchNormalization()
+        self.downsample_conv = Conv2D(filters, kernel_size=1, padding='valid')
+        self.bn_downsample = BatchNormalization()
+        self.maxpool = MaxPool2D((2, 2))
         self.dropblock = DropBlock2D(keep_prob=0.5, block_size=5)
-        self.leaky_relu = LeakyReLU(alpha=0.1)
 
     def call(self, inputs):
-        # 主路径
+        # print("ResidualBlock input shape:", inputs.shape)
+        shortcut = self.downsample_conv(inputs)
+        shortcut = self.bn_downsample(shortcut)
+
         x = self.conv1(inputs)
         x = self.bn1(x)
-        x = self.leaky_relu(x)
+        x = self.relu1(x)
 
         x = self.conv2(x)
         x = self.bn2(x)
+        x = self.relu2(x)
 
-        # 跳跃连接
-        shortcut = self.shortcut(inputs)
+        x = self.conv3(x)
+        x = self.bn3(x)
 
-        # 合并路径
-        x = Add()([x, shortcut])
-        x = self.leaky_relu(x)
+        x += shortcut
+        x = self.relu2(x)
 
         if self.downsample:
+            x = self.maxpool(x)
             x = self.dropblock(x)
 
+        # print("ResidualBlock output shape:", x.shape)
         return x
 
+    def compute_output_shape(self, input_shape):
+        if self.downsample:
+            # 如果有下采样（最大池化），空间维度减半
+            return (input_shape[0], input_shape[1] // 2, input_shape[2] // 2, self.filters)
+        else:
+            # 如果没有下采样，空间维度不变，通道数变为 filters
+            return (input_shape[0], input_shape[1], input_shape[2], self.filters)
+
     def get_config(self):
-        config = super().get_config()
+        config = super(ResidualBlock, self).get_config()
         config.update({
             'filters': self.filters,
             'downsample': self.downsample,
-            'kernel_initializer': self.kernel_initializer,
-            'use_bias': self.use_bias
         })
         return config
 
-
 class Prototypical(Model):
-    def __init__(self, n_support, n_query, w, h, c, encoder_type='resnet12', nb_layers=4, nb_filters=64):
+    def __init__(self, n_support, n_query, w, h, c, encoder_type='resnet12', nb_layers=4, nb_filters=64, base_model=None):
         super(Prototypical, self).__init__()
         self.w, self.h, self.c = w, h, c
-        self.n_support = n_support
-        self.n_query = n_query
-        self.tau = tf.Variable(0.5, trainable=True, name='temperature')  # 可学习温度参数
 
-        # 特征编码器
+        layers = []
+        if base_model is not None:
+            layers.append(base_model)
+
         if encoder_type == 'conv64F':
-            layers = []
-            for _ in range(nb_layers):
-                layers += [
-                    Conv2D(nb_filters, 3, padding='same'),
-                    BatchNormalization(),
-                    ReLU(),
-                    MaxPool2D(2)
-                ]
+            for i in range(nb_layers):
+                layers += self.conv_block(nb_filters=nb_filters)
             layers.append(Flatten())
             self.encoder = tf.keras.Sequential(layers)
         elif encoder_type == 'resnet12':
-            filters = [64, 160, 320, 640]
-            self.encoder = tf.keras.Sequential([
-                *[ResidualBlock(filters[i], downsample=True) for i in range(nb_layers)],
-                GlobalAveragePooling2D(),
-                DropBlock2D(0.5, 5),
-                Flatten()
-            ])
+            filters = [64, 160, 320, 640]  # 每个残差块的 filters 数量
+            for i in range(nb_layers):
+                layers.append(ResidualBlock(filters[i], downsample=True))
+            layers.append(GlobalAveragePooling2D())
+            layers.append(DropBlock2D(keep_prob=0.5, block_size=5))
+            layers.append(Flatten())
+            self.encoder = tf.keras.Sequential(layers)
         else:
-            raise ValueError("Unsupported encoder type")
+            raise ValueError("Unsupported encoder type. Choose 'conv64F' or 'resnet12'.")
 
-    def call(self, support_batch, query_batch):
-        # 合并输入
-        combined = tf.concat([
-            tf.reshape(support_batch, [-1, self.w, self.h, self.c]),
-            tf.reshape(query_batch, [-1, self.w, self.h, self.c])
-        ], axis=0)
+    def conv_block(self, kernel_size=3, padding='same', nb_filters=None):
+        return [
+            Conv2D(filters=nb_filters, kernel_size=kernel_size, padding=padding),
+            BatchNormalization(),
+            ReLU(),
+            MaxPool2D((2, 2))
+        ]
 
-        # 特征提取
-        z_all = self.encoder(combined)
-        z_all = tf.math.l2_normalize(z_all, axis=-1)  # L2归一化
+    def call(self, support, query):
+        n_class = support.shape[0]
+        n_support = support.shape[1]
+        n_query = query.shape[1]
+        y = np.tile(np.arange(n_class)[:, np.newaxis], (1, n_query))
+        y_onehot = tf.cast(tf.one_hot(y, n_class), tf.float32)
 
-        # 分割支持集和查询集
-        batch_size = tf.shape(support_batch)[0]
-        n_way = tf.shape(support_batch)[1]
+        target_inds = tf.reshape(tf.range(n_class), [n_class, 1])
+        target_inds = tf.tile(target_inds, [1, n_query])
 
-        # 原型计算
-        z_support = z_all[:batch_size * n_way * self.n_support]
-        z_support = tf.reshape(z_support, [batch_size, n_way, self.n_support, -1])
-        prototypes = tf.math.reduce_mean(z_support, axis=2)
-        prototypes = tf.math.l2_normalize(prototypes, axis=-1)  # 原型归一化
+        cat = tf.concat([
+            tf.reshape(support, [n_class * n_support, self.w, self.h, self.c]),
+            tf.reshape(query, [n_class * n_query, self.w, self.h, self.c])], axis=0)
+        z = self.encoder(cat)
 
-        # 查询样本
-        z_query = z_all[batch_size * n_way * self.n_support:]
-        z_query = tf.reshape(z_query, [batch_size, n_way * self.n_query, -1])
-        z_query = tf.math.l2_normalize(z_query, axis=-1)
+        z_prototypes = tf.reshape(z[:n_class * n_support], [n_class, n_support, z.shape[-1]])
+        z_prototypes = tf.math.reduce_mean(z_prototypes, axis=1)
+        z_query = z[n_class * n_support:]
 
-        # 计算距离
-        dists = calc_euclidian_dists(
-            tf.expand_dims(z_query, 2),  # [batch, nq, 1, d]
-            tf.expand_dims(prototypes, 1)  # [batch, 1, nw, d]
-        )
-        dists = tf.clip_by_value(dists, 0.0, 5.0)  # 限制距离范围
+        dists = calc_euclidian_dists(z_query, z_prototypes)
 
-        # 计算损失
-        logits = -dists / (self.tau + 1e-8)
-        labels = tf.tile(tf.range(n_way, dtype=tf.int64)[None, :],
-                         [batch_size, self.n_query])
-        labels = tf.reshape(labels, [batch_size, n_way * self.n_query])
+        log_p_y = tf.nn.log_softmax(-dists, axis=-1)
+        log_p_y = tf.reshape(log_p_y, [n_class, n_query, -1])
 
-        loss = tf.reduce_mean(
-            tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits)
-        )
-
-        # 计算准确率
-        preds = tf.argmax(logits, axis=-1, output_type=tf.int64)
-        acc = tf.reduce_mean(tf.cast(tf.equal(preds, labels), tf.float32))
+        loss = -tf.reduce_mean(tf.reshape(tf.reduce_sum(tf.multiply(y_onehot, log_p_y), axis=-1), [-1]))
+        eq = tf.cast(tf.equal(tf.cast(tf.argmax(log_p_y, axis=-1), tf.int32), tf.cast(y, tf.int32)), tf.float32)
+        acc = tf.reduce_mean(eq)
 
         return loss, acc
 
     def save(self, model_path):
-        self.encoder.save(model_path, save_format='tf')
+        """
+        Save encoder to the file.
+
+        Args:
+            model_path (str): path to the .h5 file.
+
+        Returns: None
+
+        """
+        self.encoder.save(model_path)
 
     def load(self, model_path):
-        self.encoder = tf.keras.models.load_model(model_path,
-                                                  custom_objects={
-                                                      'ResidualBlock': ResidualBlock,
-                                                      'DropBlock2D': DropBlock2D,
-                                                      'LeakyReLU': LeakyReLU
-                                                  })
+        """
+        Load encoder from the file.
+
+        Args:
+            model_path (str): path to the .h5 file.
+
+        Returns: None
+
+        """
+        self.encoder(tf.zeros([1, self.w, self.h, self.c]))
+        self.encoder.load_weights(model_path)
