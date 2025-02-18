@@ -12,4 +12,4 @@ config=${config:-"omniglot"}
 
 echo "Running $mode mode with $config configuration file"
 
-python scripts/$mode/run_$mode.py --config scripts/config/config_$config.conf
+python3 scripts/$mode/run_$mode.py --config scripts/config/config_$config.conf
